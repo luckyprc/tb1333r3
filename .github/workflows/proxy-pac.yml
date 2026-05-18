@@ -1,4 +1,4 @@
-name: Proxy Pool & PAC Generator (Google Test + HTTP/SOCKS5)
+name: Proxy Pool & PAC Generator (Real Forward + Google OK)
 
 on:
   schedule:
@@ -52,12 +52,13 @@ jobs:
           from concurrent.futures import ThreadPoolExecutor, as_completed
 
           # ========== 配置 ==========
-          TEST_URL = "http://www.google.com/generate_204"
+          HTTPBIN_URL = "http://httpbin.org/ip"
+          GOOGLE_URL = "http://www.google.com/generate_204"
           TCP_TIMEOUT = 2
-          HTTP_TIMEOUT = 6
+          HTTP_TIMEOUT = 5
+          GOOGLE_TIMEOUT = 4
           FETCH_TIMEOUT = 10
           MAX_LATENCY_MS = 5000
-          VALID_STATUS = {200, 204, 301, 302}
           MAX_WORKERS = 50
           TOP_N = 10
           MAX_HTTP = 3000
@@ -210,37 +211,52 @@ jobs:
               except Exception:
                   return False, 99999
 
-          def google_http_check(proxy_url):
-              """HTTP代理：通过代理访问Google"""
+          def forward_check(proxy_url):
+              """验证代理是否真在转发（httpbin返回的exit_ip ≠ 代理ip）"""
               try:
                   proxies = {"http": proxy_url, "https": proxy_url}
                   t0 = time.time()
-                  r = requests.get(TEST_URL, proxies=proxies, timeout=HTTP_TIMEOUT, allow_redirects=True)
+                  r = requests.get(HTTPBIN_URL, proxies=proxies, timeout=HTTP_TIMEOUT)
                   lat = (time.time() - t0) * 1000
-                  if r.status_code in VALID_STATUS and lat <= MAX_LATENCY_MS:
-                      return True, round(lat, 2), r.status_code
-                  return False, lat, r.status_code
+                  
+                  if r.status_code == 200 and "origin" in r.text:
+                      try:
+                          data = r.json()
+                          returned_ip = data.get("origin", "").split(",")[0].strip()
+                          proxy_ip = urlparse(proxy_url).hostname
+                          
+                          # 真转发：返回的IP和代理IP不同
+                          if returned_ip and proxy_ip != returned_ip and lat <= MAX_LATENCY_MS:
+                              return True, round(lat, 2), returned_ip
+                      except Exception:
+                          pass
+                  return False, lat, None
               except Exception as e:
-                  return False, 99999, str(e)[:30]
+                  return False, 99999, None
 
-          def google_socks5_check(host, port):
-              """SOCKS5代理：原生socket通过SOCKS5访问Google"""
+          def google_check(proxy_url, scheme, host, port):
+              """验证代理能否访问Google"""
               try:
-                  s = socks.socksocket()
-                  s.set_proxy(socks.SOCKS5, host, int(port), rdns=True)
-                  s.settimeout(HTTP_TIMEOUT)
-                  t0 = time.time()
-                  s.connect(("www.google.com", 80))
-                  req = b"GET /generate_204 HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n"
-                  s.send(req)
-                  data = s.recv(1024)
-                  lat = (time.time() - t0) * 1000
-                  s.close()
-                  if b"204" in data or b"HTTP/1.1 200" in data or b"HTTP/1.1 301" in data or b"HTTP/1.1 302" in data:
-                      return True, round(lat, 2), 204
-                  return False, lat, 0
+                  if scheme == "socks5":
+                      s = socks.socksocket()
+                      s.set_proxy(socks.SOCKS5, host, int(port), rdns=True)
+                      s.settimeout(GOOGLE_TIMEOUT)
+                      s.connect(("www.google.com", 80))
+                      req = b"GET /generate_204 HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n"
+                      s.send(req)
+                      data = s.recv(1024)
+                      s.close()
+                      if b"204" in data or b"HTTP/1.1 200" in data or b"HTTP/1.1 301" in data or b"HTTP/1.1 302" in data:
+                          return True, 204
+                      return False, 0
+                  else:
+                      proxies = {"http": proxy_url, "https": proxy_url}
+                      r = requests.get(GOOGLE_URL, proxies=proxies, timeout=GOOGLE_TIMEOUT, allow_redirects=True)
+                      if r.status_code in {200, 204, 301, 302}:
+                          return True, r.status_code
+                      return False, r.status_code
               except Exception as e:
-                  return False, 99999, str(e)[:30]
+                  return False, 0
 
           def validate_one(proxy_url):
               parsed = parse_proxy_url(proxy_url)
@@ -248,31 +264,34 @@ jobs:
                   return None
               host, port, scheme = parsed
               
+              # 1. TCP连通
               ok, _ = tcp_check(host, port)
               if not ok:
                   return None
               
-              if scheme == "socks5":
-                  ok, lat, status = google_socks5_check(host, port)
-                  if ok:
-                      return {
-                          "url": proxy_url, "scheme": "socks5",
-                          "host": host, "port": port,
-                          "latency": lat, "status": status
-                      }
-              elif scheme in ("http", "https"):
-                  ok, lat, status = google_http_check(proxy_url)
-                  if ok:
-                      return {
-                          "url": proxy_url, "scheme": scheme,
-                          "host": host, "port": port,
-                          "latency": lat, "status": status
-                      }
-              return None
+              # 2. 验证真转发（httpbin）
+              ok, lat, exit_ip = forward_check(proxy_url)
+              if not ok:
+                  return None
+              
+              # 3. 验证能访问Google
+              ok, g_status = google_check(proxy_url, scheme, host, port)
+              if not ok:
+                  return None
+              
+              return {
+                  "url": proxy_url,
+                  "scheme": scheme,
+                  "host": host,
+                  "port": port,
+                  "latency": lat,
+                  "status": g_status,
+                  "exit_ip": exit_ip
+              }
 
           # ========== 主流程 ==========
           log("=" * 60)
-          log("[Config] HTTP+SOCKS5 | Google Test | HTTP max:{} | SOCKS5 max:{}".format(MAX_HTTP, MAX_SOCKS5))
+          log("[Config] HTTP+SOCKS5 | Forward verify + Google OK")
           log("=" * 60)
 
           log("[1/3] Fetching proxy sources...")
@@ -320,7 +339,7 @@ jobs:
                       log("[2/3] Progress: {}/{} TCP checked, {} passed".format(checked, len(candidates), len(tcp_alive)))
           log("[2/3] Done in {:.1f}s - TCP passed: {} / {}".format(time.time() - t_start, len(tcp_alive), len(candidates)))
 
-          log("[3/3] Validating Google access ({} proxies)...".format(len(tcp_alive)))
+          log("[3/3] Validating forward + Google ({} proxies)...".format(len(tcp_alive)))
           t_start = time.time()
           alive = []
           dead = 0
@@ -333,8 +352,9 @@ jobs:
                   if res:
                       alive.append(res)
                       if len(alive) <= 5:
-                          log("[3/3] ALIVE {} | {}ms | {} {}".format(
-                              res["url"], res["latency"], res["scheme"].upper(), res["status"]
+                          log("[3/3] ALIVE {} | {}ms | {} {} | ExitIP: {}".format(
+                              res["url"], res["latency"], res["scheme"].upper(),
+                              res["status"], res["exit_ip"]
                           ))
                   else:
                       dead += 1
@@ -344,7 +364,7 @@ jobs:
 
           alive.sort(key=lambda x: x["latency"])
           selected = alive[:TOP_N]
-          log("Selected top {} Google-accessible proxies".format(len(selected)))
+          log("Selected top {} real forward + Google-OK proxies".format(len(selected)))
 
           proxy_directives = []
           for item in selected:
@@ -425,16 +445,19 @@ jobs:
 
           with open("output/proxy_list.txt", "w", encoding="utf-8") as f:
               f.write("# Generated: {}\n".format(time.strftime("%Y-%m-%d %H:%M:%S")))
-              f.write("# Mode: HTTP+SOCKS5 | Google Test | {}\n".format(TEST_URL))
-              f.write("# TCP<<{}s | HTTP<<{}s | Latency<<{}ms\n".format(TCP_TIMEOUT, HTTP_TIMEOUT, MAX_LATENCY_MS))
+              f.write("# Mode: HTTP+SOCKS5 | Forward verify + Google OK\n")
+              f.write("# TCP<<{}s | HTTP<<{}s | Google<<{}s | Latency<<{}ms\n".format(
+                  TCP_TIMEOUT, HTTP_TIMEOUT, GOOGLE_TIMEOUT, MAX_LATENCY_MS
+              ))
               f.write("-" * 60 + "\n")
               if selected:
                   for item in selected:
-                      f.write("{} | {}ms | {} {}\n".format(
-                          item["url"], item["latency"], item["scheme"].upper(), item["status"]
+                      f.write("{} | {}ms | {} {} | ExitIP: {}\n".format(
+                          item["url"], item["latency"], item["scheme"].upper(),
+                          item["status"], item["exit_ip"]
                       ))
               else:
-                  f.write("# WARNING: No Google-accessible proxies found.\n")
+                  f.write("# WARNING: No usable proxies found.\n")
 
           html_parts = [
               '<!DOCTYPE html>',
@@ -454,7 +477,7 @@ jobs:
           status_text = "OK" if selected else "NO PROXY"
           html_parts.append('<p class="{}">Status: {}</p>'.format(status_class, status_text))
           html_parts.append('<p>Generated: {}</p>'.format(time.strftime("%Y-%m-%d %H:%M:%S")))
-          html_parts.append('<p>Mode: <b>HTTP + SOCKS5 (Google Test)</b></p>')
+          html_parts.append('<p>Mode: <b>HTTP + SOCKS5 (Forward + Google OK)</b></p>')
           html_parts.append('<p>Fetched: {} HTTP + {} SOCKS5 | TCP: {} | Alive: {} | Selected: {}</p>'.format(
               len(http_candidates), len(socks_candidates), len(tcp_alive), len(alive), len(selected)
           ))
@@ -463,16 +486,16 @@ jobs:
               '<code>https://luckyprc.github.io/tb1333r3/proxy.pac</code>',
               '<h2>Selected Proxies</h2>',
               '<table>',
-              '<tr><th>Proxy</th><th>Type</th><th>Latency</th><th>Status</th></tr>',
+              '<tr><th>Proxy</th><th>Type</th><th>Latency</th><th>Status</th><th>Exit IP</th></tr>',
           ])
           if selected:
               for s in selected:
                   type_str = "SOCKS5" if s["scheme"] == "socks5" else "HTTP"
-                  html_parts.append('<tr><td>{}</td><td>{}</td><td>{}ms</td><td>{}</td></tr>'.format(
-                      s["url"], type_str, s["latency"], s["status"]
+                  html_parts.append('<tr><td>{}</td><td>{}</td><td>{}ms</td><td>{}</td><td>{}</td></tr>'.format(
+                      s["url"], type_str, s["latency"], s["status"], s["exit_ip"]
                   ))
           else:
-              html_parts.append('<tr><td colspan=4>No Google-accessible proxies</td></tr>')
+              html_parts.append('<tr><td colspan=5>No usable proxies</td></tr>')
           html_parts.extend([
               '</table>',
               '<h2>Raw List</h2>',
@@ -481,11 +504,11 @@ jobs:
           if selected:
               for s in selected:
                   type_str = "SOCKS5" if s["scheme"] == "socks5" else "HTTP"
-                  html_parts.append('{} | {}ms | {} {}'.format(
-                      s["url"], s["latency"], type_str, s["status"]
+                  html_parts.append('{} | {}ms | {} {} | ExitIP: {}'.format(
+                      s["url"], s["latency"], type_str, s["status"], s["exit_ip"]
                   ))
           else:
-              html_parts.append('No Google-accessible proxies')
+              html_parts.append('No usable proxies')
           html_parts.extend([
               '</pre>',
               '</body></html>',
